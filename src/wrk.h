@@ -6,6 +6,10 @@
 #include <inttypes.h>
 #include <sys/types.h>
 
+#include <openssl/evp.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+
 #include "stats.h"
 #include "ae.h"
 #include "http_parser.h"
@@ -49,6 +53,7 @@ typedef struct connection {
     thread *thread;
     http_parser parser;
     int fd;
+    SSL *ssl;
     uint64_t start;
     char buf[RECVBUF];
 } connection;
@@ -63,6 +68,7 @@ static int calibrate(aeEventLoop *, long long, void *);
 static int sample_rate(aeEventLoop *, long long, void *);
 static int check_timeouts(aeEventLoop *, long long, void *);
 
+static void socket_connected(aeEventLoop *, int, void *, int);
 static void socket_writeable(aeEventLoop *, int, void *, int);
 static void socket_readable(aeEventLoop *, int, void *, int);
 static int request_complete(http_parser *);

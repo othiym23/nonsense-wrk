@@ -35,6 +35,8 @@ static struct config {
     uint64_t duration;
     uint64_t timeout;
     bool     latency;
+    SSL_CTX *ctx;
+    pthread_mutex_t *locks;
 } cfg;
 
 static struct {
@@ -58,6 +60,48 @@ static volatile sig_atomic_t stop = 0;
 
 static void handler(int sig) {
     stop = 1;
+}
+
+static void ssl_lock(int mode, int n, const char *file, int line) {
+    pthread_mutex_t *lock = &cfg.locks[n];
+    if (mode & CRYPTO_LOCK) {
+        pthread_mutex_lock(lock);
+    } else {
+        pthread_mutex_unlock(lock);
+    }
+}
+
+static unsigned long ssl_id() {
+    return (unsigned long) pthread_self();
+}
+
+static bool ssl_init() {
+    pthread_mutex_t *locks;
+    SSL_CTX *ctx = NULL;
+
+    SSL_load_error_strings();
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+
+    if ((locks = calloc(CRYPTO_num_locks(), sizeof(pthread_mutex_t)))) {
+        for (int i = 0; i < CRYPTO_num_locks(); i++) {
+            pthread_mutex_init(&locks[i], NULL);
+        }
+
+        cfg.locks = locks;
+
+        CRYPTO_set_locking_callback(ssl_lock);
+        CRYPTO_set_id_callback(ssl_id);
+
+        if ((ctx = SSL_CTX_new(TLSv1_client_method()))) {
+            SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+            SSL_CTX_set_verify_depth(ctx, 0);
+            SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
+            SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT);
+        }
+    }
+
+    return (cfg.ctx = ctx) != NULL;
 }
 
 static void usage() {
@@ -127,6 +171,12 @@ int main(int argc, char **argv) {
     if (addr == NULL) {
         char *msg = strerror(errno);
         fprintf(stderr, "unable to connect to %s:%s %s\n", host, service, msg);
+        exit(1);
+    }
+
+    if (!ssl_init()) {
+        fprintf(stderr, "unable to initialize SSL\n");
+        ERR_print_errors_fp(stderr);
         exit(1);
     }
 
@@ -227,6 +277,7 @@ void *thread_main(void *arg) {
 
     for (uint64_t i = 0; i < thread->connections; i++, c++) {
         c->thread = thread;
+        c->ssl    = SSL_new(cfg.ctx);
         connect_socket(thread, c);
     }
 
@@ -265,14 +316,13 @@ static int connect_socket(thread *thread, connection *c) {
         if (errno != EINPROGRESS) goto error;
     }
 
+    SSL_set_fd(c->ssl, fd);
+
     flags = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags));
 
-    if (aeCreateFileEvent(loop, fd, AE_WRITABLE, socket_writeable, c) != AE_OK) {
-        goto error;
-    }
-
-    if (aeCreateFileEvent(loop, fd, AE_READABLE, socket_readable, c) != AE_OK) {
+    flags = AE_READABLE | AE_WRITABLE;
+    if (aeCreateFileEvent(loop, fd, flags, socket_connected, c) != AE_OK) {
         goto error;
     }
 
@@ -290,6 +340,10 @@ static int connect_socket(thread *thread, connection *c) {
 
 static int reconnect_socket(thread *thread, connection *c) {
     aeDeleteFileEvent(thread->loop, c->fd, AE_WRITABLE | AE_READABLE);
+
+    SSL_shutdown(c->ssl);
+    SSL_clear(c->ssl);
+
     close(c->fd);
     return connect_socket(thread, c);
 }
@@ -391,7 +445,7 @@ static int check_timeouts(aeEventLoop *loop, long long id, void *data) {
 static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     connection *c = data;
 
-    if (write(fd, req.buf, req.size) < req.size) goto error;
+    if (SSL_write(c->ssl, req.buf, req.size) < req.size) goto error;
     c->start = time_us();
     aeDeleteFileEvent(loop, fd, AE_WRITABLE);
 
@@ -402,11 +456,32 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     reconnect_socket(c->thread, c);
 }
 
+static void socket_connected(aeEventLoop *loop, int fd, void *data, int mask) {
+    connection *c = data;
+    int rc;
+
+    if ((rc = SSL_connect(c->ssl)) != 1) {
+        if (SSL_get_error(c->ssl, rc) != SSL_ERROR_WANT_READ) {
+            c->thread->errors.connect++;
+            reconnect_socket(c->thread, c);
+        }
+        return;
+    }
+
+    aeCreateFileEvent(c->thread->loop, c->fd, AE_READABLE, socket_readable, c);
+    aeCreateFileEvent(c->thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
+}
+
 static void socket_readable(aeEventLoop *loop, int fd, void *data, int mask) {
     connection *c = data;
-    ssize_t n;
+    int n;
 
-    if ((n = read(fd, c->buf, sizeof(c->buf))) <= 0) goto error;
+    if ((n = SSL_read(c->ssl, c->buf, sizeof(c->buf))) <= 0) {
+        switch (SSL_get_error(c->ssl, n)) {
+            case SSL_ERROR_WANT_READ: return;
+            default:                  goto error;
+        }
+    }
     if (http_parser_execute(&c->parser, &parser_settings, c->buf, n) != n) goto error;
     c->thread->bytes += n;
 
