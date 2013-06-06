@@ -8,7 +8,7 @@ ifeq ($(TARGET), sunos)
 	LIBS   += -lsocket
 endif
 
-SRC  := wrk.c aprintf.c stats.c units.c ae.c zmalloc.c http_parser.c tinymt64.c
+SRC  := wrk.c aprintf.c stats.c units.c ae.c zmalloc.c hash.c tinymt64.c
 BIN  := wrk
 
 ODIR := obj
