@@ -18,12 +18,12 @@ void sha256(void *msg, size_t msg_len, unsigned char *buf) {
     SHA_FINAL(&ctx, buf);
 }
 
-void hexillate(char *inbuf, char *outbuf) {
+void hexillate(const unsigned char *inbuf, char *outbuf, ssize_t size) {
     const static char *hex = "0123456789abcdef";
 
-    unsigned char *in = inbuf;
+    const unsigned char *in = inbuf;
     char *out = outbuf;
-    for (int i = 0; i < sizeof(inbuf); i++) {
+    for (int i = 0; i < size; i++) {
         *out++ = hex[(*in >> 4) & 0xf];
         *out++ = hex[*in++ & 0xf];
     }
@@ -41,5 +41,5 @@ void random_hash(tinymt64_t *state, char *outbuf) {
 	}
     }
 
-    hexillate(buf, outbuf);
+    hexillate(buf, outbuf, SHA_LENGTH);
 }

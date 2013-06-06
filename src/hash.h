@@ -17,6 +17,6 @@
 
 #include "tinymt64.h"
 
-void sha256(void *msg, size_t msg_len, unsigned char *buf);
-void hexillate(char *inbuf, char *outbuf);
-void random_hash(tinymt64_t *state, char *outbuf);
+void sha256(void *, size_t, unsigned char *);
+void hexillate(const unsigned char *, char *, ssize_t);
+void random_hash(tinymt64_t *, char *);
