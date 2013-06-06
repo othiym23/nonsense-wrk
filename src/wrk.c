@@ -23,7 +23,6 @@
 #include <sys/time.h>
 #include <sys/uio.h>
 
-#include "aprintf.h"
 #include "stats.h"
 #include "units.h"
 #include "zmalloc.h"
