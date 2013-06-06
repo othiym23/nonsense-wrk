@@ -431,7 +431,7 @@ static void socket_readable(aeEventLoop *loop, int fd, void *data, int mask) {
 
     if (now >= thread->stop_at) {
         aeStop(thread->loop);
-	close(fd);
+        close(c->fd);
     }
     else {
         reconnect_socket(c->thread, c);
