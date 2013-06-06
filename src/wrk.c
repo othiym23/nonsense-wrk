@@ -69,6 +69,9 @@ int main(int argc, char **argv) {
     char *host = "127.0.0.1";
     char *port = "1337";
     int rc;
+    // for checking that the server's up
+    char poke[SHA_LENGTH * 2];
+    tinymt64_t rando;
 
     if (parse_args(&cfg, &host, &port, argc, argv)) {
         usage();
@@ -90,8 +93,14 @@ int main(int argc, char **argv) {
         int fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
         if (fd == -1) continue;
         rc = connect(fd, addr->ai_addr, addr->ai_addrlen);
+        tinymt64_init(&rando, time_us());
+        random_hash(&rando, poke);
+        if (rc == 0 && write(fd, poke, SHA_LENGTH * 2) == SHA_LENGTH * 2) {
+            read(fd, poke, SHA_LENGTH * 2);
+            close(fd);
+            break;
+        }
         close(fd);
-        if (rc == 0) break;
     }
 
     if (addr == NULL) {
