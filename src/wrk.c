@@ -1,4 +1,5 @@
 // Copyright (C) 2012 - Will Glozer.  All rights reserved.
+// Copyright (C) 2013 - Forrest L Norvell.  All rights reserved.
 
 #include "wrk.h"
 
@@ -38,21 +39,10 @@ static struct config {
 } cfg;
 
 static struct {
-    char *method;
-    char *body;
-    size_t size;
-    char *buf;
-} req;
-
-static struct {
     stats *latency;
     stats *requests;
     pthread_mutex_t mutex;
 } statistics;
-
-static const struct http_parser_settings parser_settings = {
-    .on_message_complete = request_complete
-};
 
 static volatile sig_atomic_t stop = 0;
 
@@ -61,15 +51,12 @@ static void handler(int sig) {
 }
 
 static void usage() {
-    printf("Usage: wrk <options> <url>                            \n"
+    printf("Usage: wrk <options> [<host>[:<port>]]                \n"
            "  Options:                                            \n"
            "    -c, --connections <N>  Connections to keep open   \n"
            "    -d, --duration    <T>  Duration of test           \n"
            "    -t, --threads     <N>  Number of threads to use   \n"
            "                                                      \n"
-           "    -H, --header      <H>  Add header to request      \n"
-           "    -M, --method      <M>  HTTP method                \n"
-           "        --body        <B>  Request body               \n"
            "        --latency          Print latency statistics   \n"
            "        --timeout     <T>  Socket/request timeout     \n"
            "    -v, --version          Print version details      \n"
@@ -80,29 +67,13 @@ static void usage() {
 
 int main(int argc, char **argv) {
     struct addrinfo *addrs, *addr;
-    struct http_parser_url parser_url;
-    char *url, **headers;
+    char *host = "127.0.0.1";
+    char *port = "1337";
     int rc;
 
-    headers = zmalloc((argc / 2) * sizeof(char *));
-
-    if (parse_args(&cfg, &url, headers, argc, argv)) {
+    if (parse_args(&cfg, &host, &port, argc, argv)) {
         usage();
         exit(1);
-    }
-
-    if (http_parser_parse_url(url, strlen(url), 0, &parser_url)) {
-        fprintf(stderr, "invalid URL: %s\n", url);
-        exit(1);
-    }
-
-    char *host = extract_url_part(url, &parser_url, UF_HOST);
-    char *port = extract_url_part(url, &parser_url, UF_PORT);
-    char *service = port ? port : extract_url_part(url, &parser_url, UF_SCHEMA);
-    char *path = "/";
-
-    if (parser_url.field_set & (1 << UF_PATH)) {
-        path = &url[parser_url.field_data[UF_PATH].off];
     }
 
     struct addrinfo hints = {
@@ -110,9 +81,9 @@ int main(int argc, char **argv) {
         .ai_socktype = SOCK_STREAM
     };
 
-    if ((rc = getaddrinfo(host, service, &hints, &addrs)) != 0) {
+    if ((rc = getaddrinfo(host, port, &hints, &addrs)) != 0) {
         const char *msg = gai_strerror(rc);
-        fprintf(stderr, "unable to resolve %s:%s %s\n", host, service, msg);
+        fprintf(stderr, "unable to resolve %s:%s: %s\n", host, port, msg);
         exit(1);
     }
 
@@ -126,15 +97,13 @@ int main(int argc, char **argv) {
 
     if (addr == NULL) {
         char *msg = strerror(errno);
-        fprintf(stderr, "unable to connect to %s:%s %s\n", host, service, msg);
+        fprintf(stderr, "unable to connect to %s:%s: %s\n", host, port, msg);
         exit(1);
     }
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT,  SIG_IGN);
     cfg.addr = *addr;
-    req.buf  = format_request(host, port, path, headers);
-    req.size = strlen(req.buf);
 
     pthread_mutex_init(&statistics.mutex, NULL);
     statistics.latency  = stats_alloc(SAMPLES);
@@ -164,7 +133,7 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
 
     char *time = format_time_s(cfg.duration);
-    printf("Running %s test @ %s\n", time, url);
+    printf("Running %s test @ %s:%s\n", time, host, port);
     printf("  %"PRIu64" threads and %"PRIu64" connections\n", cfg.threads, cfg.connections);
 
     uint64_t start    = time_us();
@@ -179,11 +148,12 @@ int main(int argc, char **argv) {
         complete += t->complete;
         bytes    += t->bytes;
 
-        errors.connect += t->errors.connect;
-        errors.read    += t->errors.read;
-        errors.write   += t->errors.write;
-        errors.timeout += t->errors.timeout;
-        errors.status  += t->errors.status;
+        errors.connect   += t->errors.connect;
+        errors.handshake += t->errors.handshake;
+        errors.read      += t->errors.read;
+        errors.validate  += t->errors.validate;
+        errors.write     += t->errors.write;
+        errors.timeout   += t->errors.timeout;
     }
 
     uint64_t runtime_us = time_us() - start;
@@ -199,13 +169,14 @@ int main(int argc, char **argv) {
     char *runtime_msg = format_time_us(runtime_us);
 
     printf("  %"PRIu64" requests in %s, %sB read\n", complete, runtime_msg, format_binary(bytes));
-    if (errors.connect || errors.read || errors.write || errors.timeout) {
-        printf("  Socket errors: connect %d, read %d, write %d, timeout %d\n",
-               errors.connect, errors.read, errors.write, errors.timeout);
+    if (errors.connect || errors.handshake || errors.read ||
+        errors.validate || errors.write || errors.timeout) {
+        printf("  Socket errors: connect %d, handshake %d, read %d, validate %d, write %d, timeout %d\n",
+               errors.connect, errors.handshake, errors.read, errors.validate, errors.write, errors.timeout);
     }
 
-    if (errors.status) {
-        printf("  Non-2xx or 3xx responses: %d\n", errors.status);
+    if (errors.handshake) {
+        printf("  Bad handshakes from server: %d\n", errors.handshake);
     }
 
     printf("Requests/sec: %9.2Lf\n", req_per_s);
@@ -227,6 +198,7 @@ void *thread_main(void *arg) {
 
     for (uint64_t i = 0; i < thread->connections; i++, c++) {
         c->thread = thread;
+        random_hash(&thread->rand, c->hash);
         connect_socket(thread, c);
     }
 
@@ -268,16 +240,10 @@ static int connect_socket(thread *thread, connection *c) {
     flags = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags));
 
-    if (aeCreateFileEvent(loop, fd, AE_WRITABLE, socket_writeable, c) != AE_OK) {
+    if (aeCreateFileEvent(loop, fd, AE_READABLE, socket_handshake, c) != AE_OK) {
         goto error;
     }
 
-    if (aeCreateFileEvent(loop, fd, AE_READABLE, socket_readable, c) != AE_OK) {
-        goto error;
-    }
-
-    http_parser_init(&c->parser, HTTP_RESPONSE);
-    c->parser.data = c;
     c->fd = fd;
 
     return fd;
@@ -335,37 +301,47 @@ static int sample_rate(aeEventLoop *loop, long long id, void *data) {
     return SAMPLE_INTERVAL_MS;
 }
 
-static int request_complete(http_parser *parser) {
-    connection *c = parser->data;
-    thread *thread = c->thread;
-    uint64_t now = time_us();
+static int validate_response(connection *c) {
+    char *source, *ret_hash, *nonce, *freeme;
+    char scratch[512];
 
-    thread->complete++;
-    thread->requests++;
+    unsigned char vhash[SHA_LENGTH];
+    int valid = 0;
 
-    stats_record(thread->latency, now - c->start);
+    /* printf("c->buf = %s.\n", c->buf); */
+    freeme = source = strdup(c->buf);
+    ret_hash = strsep(&source, ":");
+    nonce = source;
+    /* printf("nonce = %s.\n", nonce); */
 
-    if (parser->status_code > 399) {
-        thread->errors.status++;
+    /* no colon: nope */
+    if (nonce != NULL) {
+        /* returned hash != sent hash: nope */
+        if (memcmp(ret_hash, c->hash, SHA_LENGTH * 2) == 0) {
+            strcpy(scratch, ret_hash);
+            strcat(scratch, nonce);
+            sha256(scratch, strlen(scratch), vhash);
+
+            /* is the work proved? */
+            if (vhash[SHA_LENGTH - 1] == 0) {
+                valid = 1;
+                strcpy(c->last_hash, c->hash);
+                hexillate(vhash, c->hash, SHA_LENGTH);
+            }
+            else {
+                printf("%s is not a valid proof of work.\n", c->buf);
+            }
+        }
+        else {
+            printf("received payload %s doesn't match sent payload %s.\n", ret_hash, c->hash);
+        }
+    }
+    else {
+        printf("input %s is missing a nonce.\n", c->buf);
     }
 
-    if (now >= thread->stop_at) {
-        aeStop(thread->loop);
-        goto done;
-    }
-
-    if (!http_should_keep_alive(parser)) goto reconnect;
-
-    http_parser_init(parser, HTTP_RESPONSE);
-    aeCreateFileEvent(thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
-
-    goto done;
-
-  reconnect:
-    reconnect_socket(thread, c);
-
-  done:
-    return 0;
+    free(freeme);
+    return valid;
 }
 
 static int check_timeouts(aeEventLoop *loop, long long id, void *data) {
@@ -388,10 +364,33 @@ static int check_timeouts(aeEventLoop *loop, long long id, void *data) {
     return TIMEOUT_INTERVAL_MS;
 }
 
+static void socket_handshake(aeEventLoop *loop, int fd, void *data, int mask) {
+    connection *c = data;
+    char scratch[512];
+    ssize_t n;
+
+    if ((n = read(fd, scratch, sizeof(scratch))) <= 0) goto error;
+    if (memcmp("ok\n", scratch, 3) != 0) goto error;
+
+    if (aeCreateFileEvent(loop, fd, AE_WRITABLE, socket_writeable, c) != AE_OK) {
+        goto error;
+    }
+
+    if (aeCreateFileEvent(loop, fd, AE_READABLE, socket_readable, c) != AE_OK) {
+        goto error;
+    }
+
+    return;
+
+  error:
+    c->thread->errors.handshake++;
+    reconnect_socket(c->thread, c);
+}
+
 static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     connection *c = data;
 
-    if (write(fd, req.buf, req.size) < req.size) goto error;
+    if (write(fd, c->hash, SHA_LENGTH * 2) < SHA_LENGTH * 2) goto error;
     c->start = time_us();
     aeDeleteFileEvent(loop, fd, AE_WRITABLE);
 
@@ -404,12 +403,34 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
 
 static void socket_readable(aeEventLoop *loop, int fd, void *data, int mask) {
     connection *c = data;
+    thread *thread = c->thread;
+    uint64_t now;
     ssize_t n;
 
     if ((n = read(fd, c->buf, sizeof(c->buf))) <= 0) goto error;
-    if (http_parser_execute(&c->parser, &parser_settings, c->buf, n) != n) goto error;
-    c->thread->bytes += n;
+    c->buf[n] = '\0';
 
+    now = time_us();
+    if (!validate_response(c)) goto invalid;
+    thread->bytes += n;
+    thread->complete++;
+    thread->requests++;
+
+    stats_record(thread->latency, now - c->start);
+
+    if (now >= thread->stop_at) {
+        aeStop(thread->loop);
+	close(fd);
+    }
+    else {
+        reconnect_socket(c->thread, c);
+    }
+
+    return;
+
+  invalid:
+    c->thread->errors.validate++;
+    reconnect_socket(c->thread, c);
     return;
 
   error:
@@ -423,55 +444,11 @@ static uint64_t time_us() {
     return (t.tv_sec * 1000000) + t.tv_usec;
 }
 
-static char *extract_url_part(char *url, struct http_parser_url *parser_url, enum http_parser_url_fields field) {
-    char *part = NULL;
-
-    if (parser_url->field_set & (1 << field)) {
-        uint16_t off = parser_url->field_data[field].off;
-        uint16_t len = parser_url->field_data[field].len;
-        part = zcalloc(len + 1 * sizeof(char));
-        memcpy(part, &url[off], len);
-    }
-
-    return part;
-}
-
-static char *format_request(char *host, char *port, char *path, char **headers) {
-    char *buf  = NULL;
-    char *head = NULL;
-
-    for (char **h = headers; *h != NULL; h++) {
-        aprintf(&head, "%s\r\n", *h);
-        if (!strncasecmp(*h, "Host:", 5)) {
-            host = NULL;
-            port = NULL;
-        }
-    }
-
-    if (req.body) {
-        size_t len = strlen(req.body);
-        aprintf(&head, "Content-Length: %zd\r\n", len);
-    }
-
-    aprintf(&buf, "%s %s HTTP/1.1\r\n", req.method, path);
-    if (host) aprintf(&buf, "Host: %s", host);
-    if (port) aprintf(&buf, ":%s", port);
-    if (host) aprintf(&buf, "\r\n");
-
-    aprintf(&buf, "%s\r\n", head ? head : "");
-    aprintf(&buf, "%s", req.body ? req.body : "");
-
-    free(head);
-    return buf;
-}
 
 static struct option longopts[] = {
     { "connections", required_argument, NULL, 'c' },
     { "duration",    required_argument, NULL, 'd' },
     { "threads",     required_argument, NULL, 't' },
-    { "header",      required_argument, NULL, 'H' },
-    { "method",      required_argument, NULL, 'M' },
-    { "body",        required_argument, NULL, 'B' },
     { "latency",     no_argument,       NULL, 'L' },
     { "timeout",     required_argument, NULL, 'T' },
     { "help",        no_argument,       NULL, 'h' },
@@ -479,15 +456,14 @@ static struct option longopts[] = {
     { NULL,          0,                 NULL,  0  }
 };
 
-static int parse_args(struct config *cfg, char **url, char **headers, int argc, char **argv) {
-    char c, **header = headers;
+static int parse_args(struct config *cfg, char **host, char **port, int argc, char **argv) {
+    char c, *host_str;
 
     memset(cfg, 0, sizeof(struct config));
     cfg->threads     = 2;
     cfg->connections = 10;
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
-    req.method       = "GET";
 
     while ((c = getopt_long(argc, argv, "t:c:d:H:M:B:T:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
@@ -500,15 +476,6 @@ static int parse_args(struct config *cfg, char **url, char **headers, int argc, 
             case 'd':
                 if (scan_time(optarg, &cfg->duration)) return -1;
                 break;
-            case 'H':
-                *header++ = optarg;
-                break;
-            case 'M':
-                req.method = optarg;
-                break;
-            case 'B':
-                req.body = optarg;
-                break;
             case 'L':
                 cfg->latency = true;
                 break;
@@ -517,8 +484,8 @@ static int parse_args(struct config *cfg, char **url, char **headers, int argc, 
                 cfg->timeout *= 1000;
                 break;
             case 'v':
-                printf("wrk %s [%s] ", VERSION, aeGetApiName());
-                printf("Copyright (C) 2012 Will Glozer\n");
+                printf("wrk-nonsense %s [%s] ", VERSION, aeGetApiName());
+                printf("Copyright (C) 2012 Will Glozer (hackt up by Forrest L Norvell)\n");
                 break;
             case 'r':
                 fprintf(stderr, "wrk 2.0.0+ uses -d instead of -r\n");
@@ -530,15 +497,18 @@ static int parse_args(struct config *cfg, char **url, char **headers, int argc, 
         }
     }
 
-    if (optind == argc || !cfg->threads || !cfg->duration) return -1;
+    if (!cfg->threads || !cfg->duration) return -1;
 
     if (!cfg->connections || cfg->connections < cfg->threads) {
         fprintf(stderr, "number of connections must be >= threads\n");
         return -1;
     }
 
-    *url    = argv[optind];
-    *header = NULL;
+    if (argc > 1 && optind < argc) {
+        host_str = strdup(argv[optind]);
+        *host = strsep(&host_str, ":");
+        *port = host_str;
+    }
 
     return 0;
 }
