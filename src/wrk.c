@@ -177,14 +177,17 @@ int main(int argc, char **argv) {
     char *runtime_msg = format_time_us(runtime_us);
 
     printf("  %"PRIu64" requests in %s, %sB read\n", complete, runtime_msg, format_binary(bytes));
-    if (errors.connect || errors.handshake || errors.read ||
-        errors.validate || errors.write || errors.timeout) {
-        printf("  Socket errors: connect %d, handshake %d, read %d, validate %d, write %d, timeout %d\n",
-               errors.connect, errors.handshake, errors.read, errors.validate, errors.write, errors.timeout);
+    if (errors.connect || errors.read || errors.write || errors.timeout) {
+        printf("  Socket errors: connect %d, read %d, write %d, timeout %d\n",
+               errors.connect, errors.read, errors.write, errors.timeout);
     }
 
     if (errors.handshake) {
         printf("  Bad handshakes from server: %d\n", errors.handshake);
+    }
+
+    if (errors.validate) {
+        printf("  %d proofs failed verification.\n", errors.validate);
     }
 
     printf("Requests/sec: %9.2Lf\n", req_per_s);
